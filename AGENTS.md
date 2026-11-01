@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`sm120_attn/` contains the Python package: `sparse_prefill.py` selects attention blocks and integrates with vLLM, while `sm120_attn/kernels/` holds the BF16 and FP8 CuTe DSL kernels. `tests/` contains GPU correctness and benchmark scripts. `scripts/` builds prompts and runs generation, scoring, and latency evaluations; `docs/` explains deployment and records validation results. `tools/patch_vllm.py` applies the integration hook, with notes in `patches/`. `extras/` contains optional experiments. `vllm/` is a submodule with its own contributor instructions; follow those when editing it.
+`sm120_attn/` contains the Python package: `sparse_prefill.py` selects attention blocks and integrates with vLLM, while `sm120_attn/kernels/` holds the BF16 and FP8 CuTe DSL kernels. `tests/` contains GPU correctness and benchmark scripts. `scripts/` builds prompts and runs generation, scoring, and latency evaluations; `docs/` explains deployment and records validation results. `tools/patch_vllm.py` applies the integration hook, with notes in `patches/`. `extras/` contains optional experiments. `a100_attn/` is the A100 (SM80) BF16 port: `sparse_prefill.py` (vLLM glue, paged in-place reads), `select_triton.py` (fused block selection), `gdn_intra.py` (fused GDN kkt + solve), `kernels/fa_bf16_sm80.py`; `tools/patch_vllm_a100.py` applies its hooks and `tests/test_a100_*.py` check it on an A100. See `docs/a100-report.md`. `vllm/` is a submodule with its own contributor instructions; follow those when editing it.
 
 ## Build, Test, and Development Commands
 

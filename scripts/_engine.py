@@ -29,10 +29,17 @@ def make_llm(args):
         extra['kv_cache_dtype'] = args.kv_cache_dtype
     return LLM(model=args.model, dtype=args.dtype, max_model_len=args.max_model_len, enforce_eager=not args.no_enforce_eager,
                gpu_memory_utilization=args.gpu_memory_utilization, max_num_batched_tokens=args.max_num_batched_tokens,
-               max_num_seqs=args.max_num_seqs, enable_chunked_prefill=True, enable_prefix_caching=False, seed=20261015, **extra)
+               max_num_seqs=args.max_num_seqs, enable_chunked_prefill=True, enable_prefix_caching=False, seed=20261015,
+               language_model_only=True, **extra)
 
 
 def sparse_config():
+    """The sparse module whose hook is patched into vLLM: a100_attn on the A100 branch, else sm120_attn."""
+    try:
+        from a100_attn import sparse_prefill as ksp
+        return ksp, ksp.config()
+    except Exception:
+        pass
     try:
         from sm120_attn import sparse_prefill as ksp
         return ksp, ksp.config()

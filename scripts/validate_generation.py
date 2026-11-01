@@ -46,7 +46,7 @@ def main():
             return {}
         out = {}
         for st in ksp._STATE.values():
-            kept = st.kept_fraction() if st.kernel in ('sm120', 'sm120fp8') else None
+            kept = st.kept_fraction() if getattr(st, 'kernel', None) in ('sm120', 'sm120fp8', 'sm80') else None
             out = {'calls': st.stats['calls'], 'blocks_total': st.stats['blocks_total'], 'kept_fraction': kept}
         return out
 

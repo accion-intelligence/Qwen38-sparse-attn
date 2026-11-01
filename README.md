@@ -19,6 +19,23 @@ that to **36.16 s**. The configurations and contributions behind these numbers a
 [Kernel design](docs/kernels.md) · [Performance chart](docs/speedup.html) ·
 [About Accion Intelligence](#about-accion-intelligence)
 
+## A100 (SM80) port
+
+The `A100` branch adds `a100_attn/`, a BF16 port of the dynamic block-sparse prefill for a single
+**A100-SXM4-80GB** (no FP8 on SM80): an SM80 CuTe DSL kernel that reads vLLM's paged KV cache in place and
+schedules (head, query-block) rows longest-first, a fused Triton block-selection kernel, and a fused GDN
+kkt + solve_tril kernel ported from flash-linear-attention. Single-request TTFT vs stock vLLM 0.30.0:
+**16.71 / 38.67 / 90.97 s** at 64K / 128K / 256K (stock 19.77 / 51.02 / 145.89 s,
+**1.18× / 1.32× / 1.60×**). Method, measurements, accuracy and dropped approaches:
+[A100 report](docs/a100-report.md).
+
+```bash
+python tools/patch_vllm_a100.py --target "$(python -c 'import vllm, os; print(os.path.dirname(vllm.__file__))')"
+vllm serve Qwen/Qwen3.8-27B --dtype bfloat16 --max-model-len 262144 --block-size 64 \
+    --max-num-batched-tokens 16384 --max-num-seqs 1 --enable-chunked-prefill \
+    --no-enable-prefix-caching --language-model-only
+```
+
 ## Measured performance
 
 Time to first token (TTFT) for **Qwen3.8-27B on one RTX PRO 6000 Blackwell**, one request,
