@@ -1,175 +1,145 @@
-# Qwen-3.8-27B for SM120, delivered by KAI-Pikachu
+# Qwen-3.8-27B long-context prefill on A100 (SM80)
 
-**An open-source optimization case study from [Accion Intelligence](https://accion-intelligence.com/),
-delivered by KAI-Pikachu after one day of autonomous, unattended operation.**
+**An open-source optimization case study from [Accion Intelligence](https://accion-intelligence.com/).**
 
-**KAI-Pikachu is Accion Intelligence's internal agent for end-to-end (E2E) GPU program performance
-optimization.** For this project, it ran for one day without human supervision to optimize
-**Qwen3.8-27B** long-context prefill on a single **RTX PRO 6000 Blackwell (SM120)**.
+This branch ports the dynamic block-sparse prefill of this repository from RTX PRO 6000 Blackwell (SM120) to a
+single **NVIDIA A100-SXM4-80GB (SM80)** and optimizes **Qwen3.8-27B** long-context time to first token on it.
+A100 has no FP8 tensor cores, so everything runs in BF16. The A100 code lives in `a100_attn/`; the original
+SM120 release (`sm120_attn/`, FP8 kernels) is unchanged and documented on the `main` branch.
 
-The result spans custom CuTe DSL FP8 attention kernels, dynamic block-sparse prefill, vLLM integration,
-and output-quality and latency evaluation. This repository publishes the resulting code, evaluation
-scripts, and recorded measurements so the work can be inspected, reproduced, and built on.
+At 256K input length, time to first token drops from **145.89 s to 90.97 s (1.60×)** with stock vLLM 0.30.0's
+BF16 GEMMs unchanged.
 
-At 256K input length, the optimized BF16 GEMM configuration reduces time to first token from
-**81.66 s to 49.45 s (1.65×)**. Combining the attention kernels with vLLM's built-in FP8 GEMM brings
-that to **36.16 s**. The configurations and contributions behind these numbers are detailed below.
-
-[Deployment guide](docs/deployment.md) · [Full results](docs/results.md) ·
-[Kernel design](docs/kernels.md) · [Performance chart](docs/speedup.html) ·
-[About Accion Intelligence](#about-accion-intelligence)
-
-## A100 (SM80) port
-
-The `A100` branch adds `a100_attn/`, a BF16 port of the dynamic block-sparse prefill for a single
-**A100-SXM4-80GB** (no FP8 on SM80): an SM80 CuTe DSL kernel that reads vLLM's paged KV cache in place and
-schedules (head, query-block) rows longest-first, a fused Triton block-selection kernel, and a fused GDN
-kkt + solve_tril kernel ported from flash-linear-attention. Single-request TTFT vs stock vLLM 0.30.0:
-**16.71 / 38.67 / 90.97 s** at 64K / 128K / 256K (stock 19.77 / 51.02 / 145.89 s,
-**1.18× / 1.32× / 1.60×**). Method, measurements, accuracy and dropped approaches:
-[A100 report](docs/a100-report.md).
-
-```bash
-python tools/patch_vllm_a100.py --target "$(python -c 'import vllm, os; print(os.path.dirname(vllm.__file__))')"
-vllm serve Qwen/Qwen3.8-27B --dtype bfloat16 --max-model-len 262144 --block-size 64 \
-    --max-num-batched-tokens 16384 --max-num-seqs 1 --enable-chunked-prefill \
-    --no-enable-prefix-caching --language-model-only
-```
+[A100 report](docs/a100-report.md) · [About Accion Intelligence](#about-accion-intelligence)
 
 ## Measured performance
 
-Time to first token (TTFT) for **Qwen3.8-27B on one RTX PRO 6000 Blackwell**, one request,
-prefill chunk 8192:
+Time to first token (TTFT) for **Qwen3.8-27B on one A100-SXM4-80GB**, one request, BF16, each configuration
+at its best prefill chunk (stock vLLM: 8192; A100 port: 16384):
 
-| Input length | Stock vLLM | KAI-Pikachu, BF16 GEMM¹ | Speedup vs stock | KAI-Pikachu + vLLM FP8 GEMM² |
-|---|---:|---:|---:|---:|
-| 64K | 12.06 s | 9.99 s | **1.21×** | 6.68 s |
-| 128K | 30.17 s | 21.97 s | **1.37×** | 15.20 s |
-| 256K | 81.66 s | 49.45 s | **1.65×** | 36.16 s |
+| Input length | Stock vLLM | A100 port | Speedup vs stock |
+|---|---:|---:|---:|
+| 64K | 19.77 s | 16.71 s | **1.18×** |
+| 128K | 51.02 s | 38.67 s | **1.32×** |
+| 256K | 145.89 s | 90.97 s | **1.60×** |
 
-¹ Uses KAI-Pikachu sparse FP8 attention and the optional BF16 MLP fusion. Both this configuration
-and stock vLLM use BF16 GEMMs; the reported speedup includes the fusion contribution.
+In teacher-forced evaluation against the BF16 dense reference (three prompts: code docs and two CUDA-manual
+prompts), 64K and 128K are essentially lossless (|ΔNLL| ≤ 0.002 nat, top-1 agreement ≥ 98.4%); at 256K, ΔNLL is
+−0.007 to +0.026 nat and top-1 agreement 94.9–98.4%. Needle retrieval passed at 64K, 128K and 256K for every
+prompt. See the [A100 report](docs/a100-report.md) for per-prompt numbers, the profile and the contribution of
+each step.
 
-² Uses KAI-Pikachu sparse FP8 attention with vLLM's built-in FP8 W8A8 GEMM (`--quantization fp8`).
-The FP8 GEMM implementation belongs to vLLM. A dense-attention + FP8 GEMM baseline has not yet been
-measured, so this column reports combined deployment latency.
+## What the A100 port contains
 
-In the recorded teacher-forced evaluation, the sparse FP8 attention / BF16 GEMM variant has a mean
-**ΔNLL of +0.0032 nat** and **98.7% top-1 agreement** against the BF16 dense reference. Needle retrieval
-passed the single-request tests at 64K, 128K, and 256K. See [full results](docs/results.md) for methodology,
-concurrent requests, and output comparisons; raw records are in [`docs/validation/`](docs/validation/).
-
-## What KAI-Pikachu delivered
-
-The artifacts from this run cover GPU kernels, serving integration, and measured application behavior:
-
-- **Custom FP8 and BF16 attention kernels.** The FP8 TMA kernel uses staged K/V transfers, mbarrier
-  pipelines, and register-resident attention probabilities, reaching **688 TFLOPS** in the dense
-  8K-query × 64K-key causal benchmark.
-- **Dynamic block-sparse prefill.** Attention blocks are selected per head and query block, with a
-  configurable attention-mass threshold and incremental caches for chunked prefill.
-- **vLLM integration.** A small, idempotent patch connects the kernels to vLLM 0.30.0. The release
+- **SM80 block-sparse BF16 attention kernel** (CuTe DSL, cp.async + mma.sync). It walks per-head,
+  per-query-block lists of 64-key blocks that carry τ = 0.97 of the attention mass, reads K/V **in place from
+  vLLM's paged KV cache**, and issues (head, query-block) rows **longest first**. On real 256K workloads it runs
+  at 189–194 TFLOPS of kept work, versus ~146 TFLOPS for the paged FA2 kernel vLLM uses.
+- **Fused block selection** (Triton). Masked softmax, top-mass selection by threshold bisection (no sort), and
+  list compaction in one kernel, 3.4–4.4× faster than the PyTorch implementation.
+- **Fused GDN kkt + solve_tril** (Triton, ported from flash-linear-attention) for the 48 linear-attention layers,
+  2.7× faster than vLLM's two-kernel path.
+- **vLLM integration.** `tools/patch_vllm_a100.py` adds two idempotent, revertible hooks to vLLM 0.30.0. The port
   targets prefill; decode uses vLLM's existing kernels.
-- **Evaluation tools.** Prompt construction, needle retrieval, teacher-forced output comparison,
-  and time-to-first-token benchmarks are included alongside the recorded validation results.
 
 ## Requirements
 
-The measured environment uses **RTX PRO 6000 Blackwell (CC 12.0)**, CUDA 13, PyTorch 2.13 (cu130),
-`nvidia-cutlass-dsl` 4.7.1, `cuda-python` 13.x, vLLM 0.30.0, and Python 3.12.
-
-Kernels JIT-compile on first use; no separate C++ build is required for `sm120_attn`.
+The measured environment uses **A100-SXM4-80GB (CC 8.0)**, CUDA 13.0, PyTorch 2.13 (cu130),
+`nvidia-cutlass-dsl` 4.7, vLLM 0.30.0, and Python 3.12. Kernels JIT-compile on first use; no C++ build is
+needed.
 
 ## Quick start
 
 ### Install
 
 ```bash
-git clone --recursive <this repo> && cd Qwen38-SM120-sparse-attn
+git clone -b A100 <this repo> && cd Qwen38-SM120-sparse-attn
 pip install -e .
 pip install vllm==0.30.0
-python tools/patch_vllm.py --target "$(python -c 'import vllm, os; print(os.path.dirname(vllm.__file__))')"
-# or patch and build the submodule: python tools/patch_vllm.py --target vllm/vllm && pip install -e vllm/
+python tools/patch_vllm_a100.py --target "$(python -c 'import vllm, os; print(os.path.dirname(vllm.__file__))')"
 ```
 
-The patch is idempotent. Add `--check` to inspect its status without changing files.
-For the BF16 GEMM configuration, see the [optional MLP fusion](extras/bf16_mlp_fusion/README.md).
+The patch is idempotent. Add `--check` to inspect its status without changing files, or `--revert` to restore
+stock vLLM.
 
 ### Serve
 
-The recommended deployment combines sparse FP8 attention with vLLM's FP8 GEMM. It uses a prefill
-chunk of 12032; the table above uses 8192. See the [deployment guide](docs/deployment.md) for the
-chunk-size comparison and configuration choices.
-
 ```bash
-export SM120_SPARSE_ATTN=1 SM120_SPARSE_KERNEL=sm120fp8 SM120_SPARSE_TAU=0.95
-vllm serve Qwen/Qwen3.8-27B --dtype bfloat16 --quantization fp8 \
-    --max-model-len 262144 --max-num-batched-tokens 12032 --max-num-seqs 4 \
+vllm serve Qwen/Qwen3.8-27B --dtype bfloat16 --max-model-len 262144 \
+    --block-size 64 --max-num-batched-tokens 16384 --max-num-seqs 1 \
     --enable-chunked-prefill --no-enable-prefix-caching --language-model-only
 ```
+
+`--block-size 64` makes vLLM use 832-token KV pages (a multiple of 64) so the kernel can read the cache in
+place; without it the hook falls back to copying the K/V history every chunk.
 
 ### Configure
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `SM120_SPARSE_ATTN` | 1 | enable the sparse attention hook |
-| `SM120_SPARSE_KERNEL` | `sm120fp8` | `sm120fp8` (FP8) or `sm120` (BF16) |
-| `SM120_SPARSE_FP8_PIPELINE` | `tma` | `tma` or `cpasync` |
-| `SM120_SPARSE_TAU` | 0.95 | target attention mass retained per head and query block |
-| `SM120_SPARSE_MIN_Q` / `_MIN_KV` | 1024 / 8192 | minimum chunk / context length for the sparse path |
-| `SM120_SPARSE_DEBUG` | 0 | diagnostic lines to print |
+| `A100_SPARSE_ATTN` | 1 | enable the sparse attention hook |
+| `A100_SPARSE_TAU` | 0.97 | target attention mass retained per head and query block |
+| `A100_SPARSE_M_BLOCK` | 128 | query-block rows (128 or 64) |
+| `A100_SPARSE_MIN_Q` / `_MIN_KV` | 1024 / 8192 | minimum chunk / context length for the sparse path |
+| `A100_SPARSE_PAGED` | 1 | read the paged KV cache in place when the page size is a multiple of 64 |
+| `A100_SPARSE_FUSED_SELECT` | 1 | Triton block selection (0: PyTorch reference) |
+| `A100_GDN_FUSED_KKT` | 1 | fused GDN kkt + solve_tril kernel |
+| `A100_SPARSE_DEBUG` | 0 | diagnostic lines to print |
 
-Settings can also come from a JSON file named by `SM120_SPARSE_CONFIG`.
+Settings can also come from a JSON file named by `A100_SPARSE_CONFIG`.
 
 ## Reproduce the results
 
-Install the evaluation dependencies with `pip install -e '.[eval]'`, set `MODEL` to your model
-name or local path, and provide a corpus for prompt construction:
+Install the evaluation dependencies with `pip install -e '.[eval]'`, set `MODEL` to your model name or local
+path, and provide a corpus for prompt construction:
 
 ```bash
-python scripts/build_prompts.py --model $MODEL --corpus path/to/*.md --lengths 65536,131072,260096 --concurrency 2 --output prompts.json
-SM120_SPARSE_ATTN=0 python scripts/validate_generation.py --model $MODEL --prompts prompts.json --output gen-dense.json
-python scripts/validate_generation.py --model $MODEL --prompts prompts.json --output gen-c.json --quantization fp8
-SM120_SPARSE_ATTN=0 python scripts/teacher_forced_eval.py --model $MODEL --prompts prompts.json --reference gen-dense.json --output tfe-dense.json
-python scripts/teacher_forced_eval.py --model $MODEL --prompts prompts.json --reference gen-dense.json --reference-scores tfe-dense.json --output tfe-c.json --quantization fp8
-python scripts/bench_ttft.py --model $MODEL --prompts prompts.json --output ttft-c --serve-args "--quantization fp8" --env SM120_SPARSE_KERNEL=sm120fp8
+python scripts/build_prompts.py --model $MODEL --corpus path/to/docs --lengths 65536,131072,260096 --concurrency 1 --output prompts.json
+python scripts/bench_ttft.py --model $MODEL --prompts prompts.json --output ttft-stock --concurrencies 1 --max-num-seqs 1 \
+    --env A100_SPARSE_ATTN=0 A100_GDN_FUSED_KKT=0
+python scripts/bench_ttft.py --model $MODEL --prompts prompts.json --output ttft-a100 --concurrencies 1 --max-num-seqs 1 \
+    --max-num-batched-tokens 16384 --serve-args "--block-size 64"
+A100_SPARSE_ATTN=0 A100_GDN_FUSED_KKT=0 python scripts/validate_generation.py --model $MODEL --prompts prompts.json --output gen-dense.json
+A100_SPARSE_ATTN=0 A100_GDN_FUSED_KKT=0 python scripts/teacher_forced_eval.py --model $MODEL --prompts prompts.json --reference gen-dense.json --output tfe-dense.json
+python scripts/validate_generation.py --model $MODEL --prompts prompts.json --output gen-a100.json
+python scripts/teacher_forced_eval.py --model $MODEL --prompts prompts.json --reference gen-dense.json --reference-scores tfe-dense.json --output tfe-a100.json
 ```
 
-Run kernel checks from the repository root on a compatible GPU:
+Kernel-level profile of one prefill:
 
 ```bash
-python tests/test_fa_bf16.py
-python tests/test_fa_fp8.py --big
-python tests/test_fa_fp8_tma.py --big
-python tests/test_sparse_prefill_fp8.py
+VLLM_ENABLE_V1_MULTIPROCESSING=0 nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop \
+    --trace=cuda,nvtx -o prefill-256k python scripts/profile_prefill.py --model $MODEL --prompts prompts.json \
+    --length 260096 --chunk 16384 --block-size 64
+nsys stats --report cuda_gpu_kern_sum --format csv -o prefill-256k prefill-256k.nsys-rep
+python scripts/nsys_breakdown.py prefill-256k_cuda_gpu_kern_sum.csv
+```
+
+Run the correctness checks from the repository root on an A100:
+
+```bash
+python tests/test_a100_sparse_prefill.py
+python tests/test_a100_gdn_intra.py
 ```
 
 ## Repository layout
 
 | Path | Contents |
 |---|---|
-| `sm120_attn/kernels/kai_fa_fp8_tma.py` | FP8 attention kernel with TMA and mbarrier pipelines |
-| `sm120_attn/kernels/kai_fa_fp8.py` | cp.async FP8 kernel and quantization helpers |
-| `sm120_attn/kernels/kai_fa_bf16.py` | BF16 attention kernel |
-| `sm120_attn/sparse_prefill.py` | Block selection, FP8 scale/mean caches, and vLLM entry point |
-| `tools/patch_vllm.py`, `patches/` | vLLM integration patch and notes |
-| `scripts/`, `tests/` | Evaluation scripts and GPU kernel checks |
-| `docs/` | Deployment guide, kernel design, and validation records |
-| `extras/bf16_mlp_fusion/` | Optional gate/up + SwiGLU fusion for BF16 deployments |
-
-## Roadmap
-
-- [x] Dynamic block-sparse FP8 prefill attention on SM120
-- [x] vLLM integration and evaluation scripts
-- [ ] Measure the dense-attention + vLLM FP8 GEMM baseline
-- [ ] Optimize the decode path
-- [ ] Read an FP8 KV cache directly in the sparse kernel
+| `a100_attn/kernels/fa_bf16_sm80.py` | SM80 BF16 block-sparse attention kernel (paged reads, longest-first rows) |
+| `a100_attn/sparse_prefill.py` | Block-mean caches, planning, and the vLLM entry point |
+| `a100_attn/select_triton.py` | Fused block-selection Triton kernel |
+| `a100_attn/gdn_intra.py` | Fused GDN kkt + solve_tril Triton kernel |
+| `tools/patch_vllm_a100.py` | vLLM 0.30.0 hooks (FlashAttention backend, FLA GDN chunk) |
+| `tests/test_a100_*.py` | A100 correctness checks |
+| `scripts/` | Prompt construction, TTFT benchmark, generation and teacher-forced evaluation, profiling |
+| `docs/a100-report.md` | A100 method, measurements, accuracy, and dropped approaches |
+| `sm120_attn/`, `extras/`, `tools/patch_vllm.py`, other `docs/` | Original SM120 release (see `main`) |
 
 ## About Accion Intelligence
 
 At **[Accion Intelligence](https://accion-intelligence.com/)**, we build software to unlock the performance
-of AI hardware. KAI-Pikachu brings our work on autonomous optimization to GPU programs end to end.
-This project makes one run's implementation and measured results available for the community to
+of AI hardware. This project makes the implementation and measured results available for the community to
 evaluate and build on.
 
 To explore optimization for your own GPU workloads, **[request a demo](https://accion-intelligence.com/demo)**
@@ -177,6 +147,7 @@ or contact us at [hello@accion-intelligence.com](mailto:hello@accion-intelligenc
 
 ## License and acknowledgments
 
-Released under [Apache-2.0](LICENSE). The kernels build on NVIDIA CUTLASS examples under BSD-3-Clause,
-with the original notices retained. vLLM is included as a submodule under Apache-2.0.
-See [third-party notices](THIRD_PARTY_NOTICES.md) for attribution and license details.
+Released under [Apache-2.0](LICENSE). The kernels build on NVIDIA CUTLASS examples under BSD-3-Clause, and
+`a100_attn/gdn_intra.py` contains a kernel from flash-linear-attention under MIT, with the original notices
+retained. vLLM is included as a submodule under Apache-2.0. See [third-party notices](THIRD_PARTY_NOTICES.md)
+for attribution and license details.
