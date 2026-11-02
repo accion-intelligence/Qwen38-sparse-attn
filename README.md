@@ -28,7 +28,7 @@ token is identical to stock BF16 vLLM in every configuration and run.
 - FP8 GEMM is vLLM's own CUTLASS SM90 kernel (`--quantization fp8`); the sparse attention path is this
   branch's work. The two gains stack almost additively.
 
-Output quality, teacher-forced 256-token continuation of the BF16 dense output ([raw](docs/validation/)):
+Output quality, teacher-forced 256-token continuation of the BF16 dense output (raw scores in `docs/validation/h200-tfe-*.json`, needle checks in `docs/validation/h200-*-summary.md`):
 
 | Configuration | Blocks kept 64K / 128K / 256K | ΔNLL (nat) | Top-1 agreement | Needle |
 |---|---|---|---|---|
@@ -36,6 +36,34 @@ Output quality, teacher-forced 256-token continuation of the BF16 dense output (
 | Sparse tau 0.95 + FP8 GEMM | same | +0.0006 / +0.0065 / +0.0110 | 0.992 / 0.977 / 0.965 | retrieved |
 | Sparse tau 0.9 | 0.48 / 0.35 / 0.42 | +0.0021 / +0.0105 / +0.0265 | 0.996 / 0.977 / 0.957 | retrieved |
 | Dense + FP8 GEMM | - | +0.0003 / -0.0071 / -0.0006 | 1.000 / 0.992 / 0.992 | retrieved |
+
+Where the prefill time goes (GPU kernel time, torch.compile on, the serving configuration;
+`scripts/h200/profile_prefill.py`):
+
+| Share of kernel time | Stock 64K | Stock 256K | Sparse 64K | Sparse 256K |
+|---|---:|---:|---:|---:|
+| GEMM (cuBLAS BF16) | 69.8% | 43.4% | 73.8% | 53.6% |
+| Attention | 20.7% (FA3) | 50.7% (FA3) | 14.2% (FA4 sparse) | 35.9% (FA4 sparse) |
+| Norm / RoPE / activation | 4.4% | 2.8% | 4.7% | 3.4% |
+| GDN linear attention | 3.7% | 2.3% | 3.9% | 2.9% |
+| Elementwise / copies | 0.5% | 0.3% | 2.2% | 3.3% |
+
+Attention kernel, Nsight Compute at 8K query x 256K context, 55% of blocks kept, clocks locked at base
+([report](docs/validation/h200-ncu-fa4sparse-vs-dense.md)):
+
+| Kernel | Time | Tensor pipe active | L2 hit | DRAM read |
+|---|---:|---:|---:|---:|
+| FA3 dense (vLLM C++), all blocks | 72.8 ms | 99.7% | 93.6% | 4 GB |
+| FA4 dense (CuTe DSL), all blocks | 72.8 ms | 99.9% | 93.6% | 13 GB |
+| FA4 block-sparse, upstream b37 | 46.7 ms | 86.3% | 62% | 59 GB |
+| FA4 block-sparse, patches 1-3 | 44.2 ms | 90.7% | 71% | 37 GB |
+
+Patch 4 (sorted dispatch) on top, unlocked clocks, lists with the per-head density skew of real prompts:
+50.9 -> 43.4 ms (-15%) at 256K and 54% kept, 32.1 -> 29.8 ms (-7%) at 37% kept, no change at 64K.
+
+cuBLAS BF16 already runs at 680-805 TFLOPS on the model's GEMM shapes (the H200's sustained rate); FP8 W8A8
+is 1.86x faster on the same shapes, which is where the FP8 GEMM gain comes from. Inductor fuses the norm,
+gating and copy chains under torch.compile, so hand-fused elementwise kernels give nothing end to end.
 
 ## What this branch adds
 
