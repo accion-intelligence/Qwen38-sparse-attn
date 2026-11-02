@@ -25,11 +25,8 @@ vllm serve Qwen/Qwen3.8-27B --dtype bfloat16 --quantization fp8 \
 
 Single request, prefill chunk 8192; chunk 12032 adds another ~2%. Needle retrieval passes for every variant.
 
-- **Our attention work alone:** A vs stock, 1.21× / 1.37× / 1.65× (same BF16 GEMM).
-- **vLLM's FP8 GEMM on top of A:** 1.50× / 1.45× / 1.37× (A → C). That is more than our attention gain at 64K
-  and 128K; only at 256K does attention dominate (attention is ~22% of TTFT at 64K). The stock → C ratio (1.81× / 1.98× / 2.26×) mixes both and must not be read as this repo's gain.
-  Isolating our share under FP8 GEMM needs the missing "dense + FP8 GEMM" row. B → C (our BF16 → our FP8
-  kernel, FP8 GEMM fixed) gives 1.08× / 1.14× / 1.23×, a lower bound on that share.
+- A vs stock isolates the attention gain: 1.21× / 1.37× / 1.65×. C vs stock includes vLLM's FP8 GEMM;
+  dense attention + FP8 GEMM was not measured on this card.
 - FP8 attention adds almost no error on top of sparsity (per-token |Δlogprob| 0.015 vs 0.015 at 64K);
   FP8 GEMM roughly doubles it, and C ≈ B in error. Pick A if output fidelity matters more than speed.
 - `--max-num-batched-tokens 12032` makes the attention grid (24 heads × 94 query blocks = 2256 CTAs) exactly
@@ -76,16 +73,3 @@ Caches are keyed by (layer, first KV page) and record where the previous chunk e
 | FP8, 128-row blocks, 8 warps, P via smem | 23.0 | 538 |
 | + K double buffer, P in registers (`kai_fa_fp8`) | 19.5 | 635 |
 | + TMA, 2-stage mbarrier pipelines, producer warp group (`kai_fa_fp8_tma`) | **18.0** | **688** |
-
-Tried and dropped: split-D warp pairs (−28%), FA3-style warp-group ping-pong, intra-warp S double buffering,
-explicit ldmatrix prefetch, and MXF8 block scaling (emulated error 3.0–3.8% vs 1.3–3.2% for per-tensor scales).
-Details in [kernels.md](kernels.md).
-
-## TODO
-
-- [ ] Measure dense attention + vLLM FP8 GEMM (stock + `--quantization fp8`) to isolate the attention gain in C.
-- [ ] Decode path optimisation (currently vLLM's stock decode kernels).
-- [ ] FP8 KV cache, read directly by the sparse kernel (removes the per-chunk gather + quantise + transpose).
-- [ ] Static per-layer FP8 scales from calibration.
-- [ ] Fuse block-mean updates into the KV-cache write.
-- [ ] Fuse small memory-bound kernels around the GEMMs (norm, GDN conv, gating), ~2–3%.

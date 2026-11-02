@@ -21,14 +21,5 @@ one warmup + two measured runs per case; greedy; first generated token checked a
 | 128K (131072 in), 1 request | 16236 ms | 16280 ms | 16276 ms | **16278 ms** |
 | 256K (260096 in), 1 request | 42498 ms | 42430 ms | 42449 ms | **42439 ms** |
 
-Against the RTX PRO 6000 Blackwell numbers in [results.md](../results.md) (same prompts recipe, chunk 8192):
-
-| input | H200 stock (this run) | SM120 stock | SM120 best (C: FP8 sparse attn + FP8 GEMM) |
-|---|---:|---:|---:|
-| 64K | 6.76 s | 12.06 s | 6.68 s |
-| 128K | 16.28 s | 30.17 s | 15.20 s |
-| 256K | 42.44 s | 81.66 s | 36.16 s |
-
-Scaling: 64K -> 128K is 2.41x, 128K -> 256K is 2.61x (pure O(N) work would be 2.0x), so at 256K a sizeable
-share of the time is already quadratic (attention) even with FA3. Raw files: `/local1/li004074/exp/ttft-stock-c1/`
+Raw files: `/local1/li004074/exp/ttft-stock-c1/`
 (`results.json`, `server.log`, `summary.md`).

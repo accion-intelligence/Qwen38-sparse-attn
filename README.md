@@ -9,7 +9,7 @@ The result combines dynamic block-sparse prefill attention, built on the FlashAt
 with four kernel patches, with vLLM's FP8 W8A8 GEMM. Every number below is reproducible with the scripts in
 `scripts/h200/`; the raw records are in `docs/validation/` (files prefixed `h200-`).
 
-[Summary](docs/h200-summary.md) · [Full measurement log](docs/h200.md) · [Kernel analysis (Nsight Compute)](docs/validation/h200-ncu-fa4sparse-vs-dense.md)
+[Summary](docs/h200-summary.md) · [Configuration and measurements](docs/h200.md) · [Kernel analysis (Nsight Compute)](docs/validation/h200-ncu-fa4sparse-vs-dense.md)
 
 ## Measured performance
 
