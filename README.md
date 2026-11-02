@@ -1,169 +1,132 @@
-# Qwen-3.8-27B for SM120, delivered by KAI-Pikachu
+# Qwen3.8-27B long-prompt prefill on NVIDIA H200 (SM90)
 
-**An open-source optimization case study from [Accion Intelligence](https://accion-intelligence.com/),
-delivered by KAI-Pikachu after one day of autonomous, unattended operation.**
+An open-source optimization case study from [Accion Intelligence](https://accion-intelligence.com/): minimum
+time to first token (TTFT) for a single long request (64K / 128K / 256K input tokens) of **Qwen3.8-27B** on
+**one NVIDIA H200 SXM**. This branch (`h200`) re-targets the project at Hopper; the RTX PRO 6000 Blackwell
+(SM120) release stays on `main`.
 
-**KAI-Pikachu is Accion Intelligence's internal agent for end-to-end (E2E) GPU program performance
-optimization.** For this project, it ran for one day without human supervision to optimize
-**Qwen3.8-27B** long-context prefill on a single **RTX PRO 6000 Blackwell (SM120)**.
+The result combines dynamic block-sparse prefill attention, built on the FlashAttention-4 CuTe DSL SM90 kernel
+with four kernel patches, with vLLM's FP8 W8A8 GEMM. Every number below is reproducible with the scripts in
+`scripts/h200/`; the raw records are in `docs/validation/` (files prefixed `h200-`).
 
-The result spans custom CuTe DSL FP8 attention kernels, dynamic block-sparse prefill, vLLM integration,
-and output-quality and latency evaluation. This repository publishes the resulting code, evaluation
-scripts, and recorded measurements so the work can be inspected, reproduced, and built on.
-
-At 256K input length, the optimized BF16 GEMM configuration reduces time to first token from
-**81.66 s to 49.45 s (1.65×)**. Combining the attention kernels with vLLM's built-in FP8 GEMM brings
-that to **36.16 s**. The configurations and contributions behind these numbers are detailed below.
-
-**H200 (SM90) branch:** the same model on one NVIDIA H200 reaches 4657 / 10426 / 28789 ms TTFT at 64K / 128K /
-256K (-30% / -35% / -32% vs stock vLLM) with FlashAttention-4 block-sparse attention plus FP8 GEMM; see
-[docs/h200-summary.md](docs/h200-summary.md) (summary) and [docs/h200.md](docs/h200.md) (full log).
-
-[Deployment guide](docs/deployment.md) · [Full results](docs/results.md) ·
-[Kernel design](docs/kernels.md) · [Performance chart](docs/speedup.html) ·
-[About Accion Intelligence](#about-accion-intelligence)
+[Summary](docs/h200-summary.md) · [Full measurement log](docs/h200.md) · [Kernel analysis (Nsight Compute)](docs/validation/h200-ncu-fa4sparse-vs-dense.md)
 
 ## Measured performance
 
-Time to first token (TTFT) for **Qwen3.8-27B on one RTX PRO 6000 Blackwell**, one request,
-prefill chunk 8192:
+TTFT for one request on one H200, prefill chunk 8192, mean of two measured runs after one warm-up, four
+configurations run back to back ([raw](docs/validation/h200-matrix-gpu4-20261101.md)). The first generated
+token is identical to stock BF16 vLLM in every configuration and run.
 
-| Input length | Stock vLLM | KAI-Pikachu, BF16 GEMM¹ | Speedup vs stock | KAI-Pikachu + vLLM FP8 GEMM² |
+| Input length | Stock vLLM 0.30.0 (BF16, FlashAttention-3) | Sparse attention (tau 0.95) | Dense + FP8 GEMM | Sparse + FP8 GEMM |
 |---|---:|---:|---:|---:|
-| 64K | 12.06 s | 9.99 s | **1.21×** | 6.68 s |
-| 128K | 30.17 s | 21.97 s | **1.37×** | 15.20 s |
-| 256K | 81.66 s | 49.45 s | **1.65×** | 36.16 s |
+| 64K | 6666 ms | 6323 ms (-5.1%) | 5043 ms (-24.4%) | **4657 ms (-30.1%)** |
+| 128K | 16040 ms | 13789 ms (-14.0%) | 12679 ms (-21.0%) | **10426 ms (-35.0%)** |
+| 256K | 42259 ms | 35557 ms (-15.9%) | 35550 ms (-15.9%) | **28789 ms (-31.9%)** |
 
-¹ Uses KAI-Pikachu sparse FP8 attention and the optional BF16 MLP fusion. Both this configuration
-and stock vLLM use BF16 GEMMs; the reported speedup includes the fusion contribution.
+- The sorted tile dispatch (now the default, see below) adds -2.2% at 256K in a separate A/B.
+- Speed operating point, tau 0.9 + FP8 GEMM: 4529 / 9652 / 25197 ms (-32% / -40% / -40%).
+- FP8 GEMM is vLLM's own CUTLASS SM90 kernel (`--quantization fp8`); the sparse attention path is this
+  branch's work. The two gains stack almost additively.
 
-² Uses KAI-Pikachu sparse FP8 attention with vLLM's built-in FP8 W8A8 GEMM (`--quantization fp8`).
-The FP8 GEMM implementation belongs to vLLM. A dense-attention + FP8 GEMM baseline has not yet been
-measured, so this column reports combined deployment latency.
+Output quality, teacher-forced 256-token continuation of the BF16 dense output ([raw](docs/validation/)):
 
-In the recorded teacher-forced evaluation, the sparse FP8 attention / BF16 GEMM variant has a mean
-**ΔNLL of +0.0032 nat** and **98.7% top-1 agreement** against the BF16 dense reference. Needle retrieval
-passed the single-request tests at 64K, 128K, and 256K. See [full results](docs/results.md) for methodology,
-concurrent requests, and output comparisons; raw records are in [`docs/validation/`](docs/validation/).
+| Configuration | Blocks kept 64K / 128K / 256K | ΔNLL (nat) | Top-1 agreement | Needle |
+|---|---|---|---|---|
+| Sparse tau 0.95 | 0.62 / 0.47 / 0.56 | +0.0007 / +0.0071 / +0.0105 | 0.992 / 0.977 / 0.973 | retrieved |
+| Sparse tau 0.95 + FP8 GEMM | same | +0.0006 / +0.0065 / +0.0110 | 0.992 / 0.977 / 0.965 | retrieved |
+| Sparse tau 0.9 | 0.48 / 0.35 / 0.42 | +0.0021 / +0.0105 / +0.0265 | 0.996 / 0.977 / 0.957 | retrieved |
+| Dense + FP8 GEMM | - | +0.0003 / -0.0071 / -0.0006 | 1.000 / 0.992 / 0.992 | retrieved |
 
-## What KAI-Pikachu delivered
+## What this branch adds
 
-The artifacts from this run cover GPU kernels, serving integration, and measured application behavior:
+- **Sparse prefill attention on SM90.** `SparsePrefill(kernel='fa4')` drives FlashAttention-4's CuTe DSL
+  SM90 forward (wgmma, TMA, warp specialisation) with this repository's block selection: per-query-head lists
+  over 128-row query blocks and 64-token KV blocks, mask/full split at the causal boundary, cached key block
+  means, 64-row selection granularity. Dense FA3 runs the tensor pipe at 99.7%; the sparse kernel runs at
+  90.7% on the kept blocks (629 TFLOPS at 8K x 256K, 55% kept) after the patches below.
+- **Fused selection kernel** (`sm120_attn/select_fused.py`, Triton): masked softmax, top-mass threshold,
+  diagonal/sink forcing and FA4 list packing in one kernel (1.27 -> 0.63 ms per call at 8K x 64K).
+- **FA4 kernel patches** (`tools/patch_fa4.py`, applied to the installed `flash_attn/cute`):
+  1. block-sparse loads through a page table, so the kernel reads vLLM's paged cache in place;
+  2. software-pipelined list-index loads in the producer warp;
+  3. no mask function on fully visible blocks (-6.6% kernel time; dense FA4 already skips it);
+  4. `SortedPersistentTileScheduler`: tiles launched longest-list-first (-15% kernel time under the per-head
+     skew of real prompts, -2.2% TTFT at 256K).
+- **vLLM integration** for vLLM 0.30.0 through the same idempotent hook as `main` (`tools/patch_vllm.py`).
+- **Measurement and quality tooling**: back-to-back TTFT matrix, teacher-forced quality pipeline,
+  compiled-mode kernel breakdown, kernel microbenchmarks, Nsight Compute driver and report.
+- **Two-GPU serving (experimental)**: prefill/decode disaggregation over NVLink with vLLM's NIXL connector,
+  prefill on the sparse stack, decode on a second H200 (`scripts/h200/pd_serve.sh`, `pd_client.py`,
+  `pd_bench.sh`).
 
-- **Custom FP8 and BF16 attention kernels.** The FP8 TMA kernel uses staged K/V transfers, mbarrier
-  pipelines, and register-resident attention probabilities, reaching **688 TFLOPS** in the dense
-  8K-query × 64K-key causal benchmark.
-- **Dynamic block-sparse prefill.** Attention blocks are selected per head and query block, with a
-  configurable attention-mass threshold and incremental caches for chunked prefill.
-- **vLLM integration.** A small, idempotent patch connects the kernels to vLLM 0.30.0. The release
-  targets prefill; decode uses vLLM's existing kernels.
-- **Evaluation tools.** Prompt construction, needle retrieval, teacher-forced output comparison,
-  and time-to-first-token benchmarks are included alongside the recorded validation results.
+What was measured and not adopted is recorded in [docs/h200.md](docs/h200.md): FlashInfer's block-sparse
+kernel (230 TFLOPS), the SM120 `mma.sync` kernels on Hopper (209-319 TFLOPS), a fused RMSNorm (no gain under
+torch.compile), 80-token KV blocks (1-7% but breaks page alignment), a persistent tile scheduler (register
+spills on SM90), and vLLM's FA3 FP8 forward at head_dim 256 (2x slower than BF16).
 
 ## Requirements
 
-The measured environment uses **RTX PRO 6000 Blackwell (CC 12.0)**, CUDA 13, PyTorch 2.13 (cu130),
-`nvidia-cutlass-dsl` 4.7.1, `cuda-python` 13.x, vLLM 0.30.0, and Python 3.12.
-
-Kernels JIT-compile on first use; no separate C++ build is required for `sm120_attn`.
+H200 (CC 9.0) with a CUDA 12.9 driver; Python 3.12; PyTorch 2.13.0+cu129; vLLM 0.30.0+cu129; flash-attn-4
+4.0.0b37; nvidia-cutlass-dsl 4.7.1; Triton 3.7.1; nixl 1.5.2 (two-GPU serving only). `scripts/h200/setup_env.sh`
+installs all of it into a venv (on local disk; `scripts/h200/env.sh` holds the paths).
 
 ## Quick start
 
-### Install
-
 ```bash
-git clone --recursive <this repo> && cd Qwen38-SM120-sparse-attn
-pip install -e .
-pip install vllm==0.30.0
-python tools/patch_vllm.py --target "$(python -c 'import vllm, os; print(os.path.dirname(vllm.__file__))')"
-# or patch and build the submodule: python tools/patch_vllm.py --target vllm/vllm && pip install -e vllm/
-```
+bash scripts/h200/setup_env.sh                      # venv, vLLM 0.30.0+cu129, flash-attn-4 + kernel patches, NIXL
+source scripts/h200/env.sh
+python scripts/h200/check_env.py --jit              # device, FA3/FA4, CuTe JIT, patch anchors, model files
+python tools/patch_vllm.py --target "$(python -c 'import vllm,os;print(os.path.dirname(vllm.__file__))')"
 
-The patch is idempotent. Add `--check` to inspect its status without changing files.
-For the BF16 GEMM configuration, see the [optional MLP fusion](extras/bf16_mlp_fusion/README.md).
-
-### Serve
-
-The recommended deployment combines sparse FP8 attention with vLLM's FP8 GEMM. It uses a prefill
-chunk of 12032; the table above uses 8192. See the [deployment guide](docs/deployment.md) for the
-chunk-size comparison and configuration choices.
-
-```bash
-export SM120_SPARSE_ATTN=1 SM120_SPARSE_KERNEL=sm120fp8 SM120_SPARSE_TAU=0.95
+export SM120_SPARSE_ATTN=1 SM120_SPARSE_KERNEL=fa4 SM120_SPARSE_TAU=0.95
 vllm serve Qwen/Qwen3.8-27B --dtype bfloat16 --quantization fp8 \
-    --max-model-len 262144 --max-num-batched-tokens 12032 --max-num-seqs 4 \
+    --max-model-len 262144 --max-num-batched-tokens 8192 --max-num-seqs 4 \
     --enable-chunked-prefill --no-enable-prefix-caching --language-model-only
 ```
 
-### Configure
+Environment variables (the `SM120_` prefix is kept for compatibility with `main`):
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `SM120_SPARSE_ATTN` | 1 | enable the sparse attention hook |
-| `SM120_SPARSE_KERNEL` | `sm120fp8` | `sm120fp8` (FP8) or `sm120` (BF16) |
-| `SM120_SPARSE_FP8_PIPELINE` | `tma` | `tma` or `cpasync` |
-| `SM120_SPARSE_TAU` | 0.95 | target attention mass retained per head and query block |
+| `SM120_SPARSE_KERNEL` | `fa4` on SM90 | attention core (`fa4`; the SM120 kernels remain selectable) |
+| `SM120_SPARSE_TAU` | 0.95 | attention mass retained per head and query block |
+| `SM120_SPARSE_SELECT_QB` | 64 | query rows per selection block (64 or 128) |
+| `SM120_SPARSE_SCHED` | `sorted` | tile dispatch: longest lists first, or FA4's `static` grid |
+| `SM120_SPARSE_PAGED` | 1 | read the paged KV cache in place when pages are 64-token aligned (`--block-size 1024`) |
+| `SM120_SPARSE_FUSED_SELECT` | 1 | fused Triton selection (0: torch ops) |
 | `SM120_SPARSE_MIN_Q` / `_MIN_KV` | 1024 / 8192 | minimum chunk / context length for the sparse path |
-| `SM120_SPARSE_DEBUG` | 0 | diagnostic lines to print |
 
-Settings can also come from a JSON file named by `SM120_SPARSE_CONFIG`.
-
-## Reproduce the results
-
-Install the evaluation dependencies with `pip install -e '.[eval]'`, set `MODEL` to your model
-name or local path, and provide a corpus for prompt construction:
+## Reproduce
 
 ```bash
-python scripts/build_prompts.py --model $MODEL --corpus path/to/*.md --lengths 65536,131072,260096 --concurrency 2 --output prompts.json
-SM120_SPARSE_ATTN=0 python scripts/validate_generation.py --model $MODEL --prompts prompts.json --output gen-dense.json
-python scripts/validate_generation.py --model $MODEL --prompts prompts.json --output gen-c.json --quantization fp8
-SM120_SPARSE_ATTN=0 python scripts/teacher_forced_eval.py --model $MODEL --prompts prompts.json --reference gen-dense.json --output tfe-dense.json
-python scripts/teacher_forced_eval.py --model $MODEL --prompts prompts.json --reference gen-dense.json --reference-scores tfe-dense.json --output tfe-c.json --quantization fp8
-python scripts/bench_ttft.py --model $MODEL --prompts prompts.json --output ttft-c --serve-args "--quantization fp8" --env SM120_SPARSE_KERNEL=sm120fp8
+bash scripts/h200/build_prompts.sh                            # 64K / 128K / 256K needle prompts from local markdown
+CUDA_VISIBLE_DEVICES=4 TAU=0.95 bash scripts/h200/final_matrix.sh   # stock / sparse / FP8 / sparse+FP8, back to back
+TAU=0.95 bash scripts/h200/quality.sh                         # needle retrieval + teacher-forced scores
+python scripts/h200/profile_prefill.py --no-enforce-eager ... # per-kernel-category breakdown (serving config)
+python tests/test_sparse_prefill_fa4.py --big                 # kernel correctness vs fp32 reference, timing
 ```
 
-Run kernel checks from the repository root on a compatible GPU:
-
-```bash
-python tests/test_fa_bf16.py
-python tests/test_fa_fp8.py --big
-python tests/test_fa_fp8_tma.py --big
-python tests/test_sparse_prefill_fp8.py
-```
-
-## Repository layout
+## Repository layout (additions on this branch)
 
 | Path | Contents |
 |---|---|
-| `sm120_attn/kernels/kai_fa_fp8_tma.py` | FP8 attention kernel with TMA and mbarrier pipelines |
-| `sm120_attn/kernels/kai_fa_fp8.py` | cp.async FP8 kernel and quantization helpers |
-| `sm120_attn/kernels/kai_fa_bf16.py` | BF16 attention kernel |
-| `sm120_attn/sparse_prefill.py` | Block selection, FP8 scale/mean caches, and vLLM entry point |
-| `tools/patch_vllm.py`, `patches/` | vLLM integration patch and notes |
-| `scripts/`, `tests/` | Evaluation scripts and GPU kernel checks |
-| `docs/` | Deployment guide, kernel design, and validation records |
-| `extras/bf16_mlp_fusion/` | Optional gate/up + SwiGLU fusion for BF16 deployments |
+| `sm120_attn/sparse_prefill.py` | block selection, caches, vLLM hook; `forward_fa4` (SM90 path) |
+| `sm120_attn/select_fused.py` | fused Triton selection kernel |
+| `tools/patch_fa4.py`, `tools/fa4_sorted_scheduler.py` | FlashAttention-4 kernel patches and the sorted tile scheduler |
+| `scripts/h200/` | environment, benchmarks, quality pipeline, profiling, two-GPU serving |
+| `tests/test_sparse_prefill_fa4*.py` | SM90 path tests (reference, fused vs torch lists, paged vs gathered) |
+| `docs/h200-summary.md`, `docs/h200.md`, `docs/validation/h200-*` | summary, full log, raw records |
 
-## Roadmap
+## Status and next steps
 
-- [x] Dynamic block-sparse FP8 prefill attention on SM120
-- [x] vLLM integration and evaluation scripts
-- [ ] Measure the dense-attention + vLLM FP8 GEMM baseline
-- [ ] Optimize the decode path
-- [ ] Read an FP8 KV cache directly in the sparse kernel
-
-## About Accion Intelligence
-
-At **[Accion Intelligence](https://accion-intelligence.com/)**, we build software to unlock the performance
-of AI hardware. KAI-Pikachu brings our work on autonomous optimization to GPU programs end to end.
-This project makes one run's implementation and measured results available for the community to
-evaluate and build on.
-
-To explore optimization for your own GPU workloads, **[request a demo](https://accion-intelligence.com/demo)**
-or contact us at [hello@accion-intelligence.com](mailto:hello@accion-intelligence.com).
+Done: block-sparse prefill attention on SM90 with a patched FA4 kernel, fused selection, sorted dispatch, FP8
+GEMM evaluation, quality validation, two-GPU PD serving path. Open: an FP8 attention kernel for head_dim 256
+on SM90 (no existing kernel is faster than BF16 here), cross-SM cooperation on the decode side, and a fused
+gate-up GEMM with SwiGLU epilogue (~2-3% of TTFT). Details in [docs/h200-summary.md](docs/h200-summary.md).
 
 ## License and acknowledgments
 
-Released under [Apache-2.0](LICENSE). The kernels build on NVIDIA CUTLASS examples under BSD-3-Clause,
-with the original notices retained. vLLM is included as a submodule under Apache-2.0.
-See [third-party notices](THIRD_PARTY_NOTICES.md) for attribution and license details.
+Released under [Apache-2.0](LICENSE). The SM90 attention core is FlashAttention-4 (CuTe DSL, BSD-3-Clause),
+patched in place by `tools/patch_fa4.py`; the SM120 kernels on `main` build on NVIDIA CUTLASS examples
+(BSD-3-Clause); vLLM is Apache-2.0. See [third-party notices](THIRD_PARTY_NOTICES.md).
