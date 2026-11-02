@@ -1,0 +1,10 @@
+device: NVIDIA H200 | M = 8192
+gemm                        K      N x/model |  bf16 ms  TFLOPS |   fp8 ms  TFLOPS | per-chunk total bf16 / fp8 (ms)
+gdn qkvz proj            5120  16384      48 |    1.731     794 |    0.933    1474 |     83.1 /     44.8
+gdn ba proj              5120     96      48 |    0.027     295 |    0.017     471 |      1.3 /      0.8
+gdn out proj             6144   5120      48 |    0.647     796 |    0.352    1464 |     31.1 /     16.9
+attn qkv(+gate) proj     5120  14336      16 |    1.493     805 |    0.818    1471 |     23.9 /     13.1
+attn o proj              6144   5120      16 |    0.691     746 |    0.398    1295 |     11.1 /      6.4
+mlp gate_up              5120  34816      64 |    4.075     717 |    2.217    1317 |    260.8 /    141.9
+mlp down                17408   5120      64 |    2.148     680 |    1.114    1311 |    137.5 /     71.3
+all GEMMs of one 8192-token chunk: bf16 548.7 ms, fp8 295.1 ms (1.86x); x8 chunks (64K prefill): 4.39 s vs 2.36 s

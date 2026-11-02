@@ -1,0 +1,5 @@
+device: NVIDIA H200
+== 8192 x 65536: FA3 bf16   17.22 ms ( 718 TFLOPS)
+   FA3 fp8 e4m3 (per-tensor descales):   31.93 ms ( 387 TFLOPS) = 0.54x bf16 | rel L2 err vs bf16 5.339e-02 | out dtype torch.bfloat16
+== 8192 x 262144: FA3 bf16   72.58 ms ( 716 TFLOPS)
+   FA3 fp8 e4m3 (per-tensor descales):  143.56 ms ( 362 TFLOPS) = 0.51x bf16 | rel L2 err vs bf16 5.267e-02 | out dtype torch.bfloat16

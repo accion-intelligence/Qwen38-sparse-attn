@@ -46,8 +46,8 @@ def main():
             return {}
         out = {}
         for st in ksp._STATE.values():
-            kept = st.kept_fraction() if st.kernel in ('sm120', 'sm120fp8') else None
-            out = {'calls': st.stats['calls'], 'blocks_total': st.stats['blocks_total'], 'kept_fraction': kept}
+            kept = st.kept_fraction() if st.kernel in ('sm120', 'sm120fp8', 'fa4') else None
+            out = {'calls': st.stats['calls'], 'blocks_total': st.stats['blocks_total'], 'kept_fraction': kept, 'list_stats': st.list_stats_summary() if hasattr(st, 'list_stats_summary') else None}
         return out
 
     groups = [prompts] if args.batched else [[r] for r in prompts]

@@ -28,6 +28,9 @@ HOOK = '''            else:
                 causal = attn_metadata.causal
                 is_dynamic_causal = isinstance(causal, torch.Tensor)
 '''
+# H200 branch: import-time fusions (fused GemmaRMSNorm, SM120_FUSED_NORM) for the Qwen3.5 model module
+FUSION_ANCHOR = 'from vllm.model_executor.layers.layernorm import GemmaRMSNorm as Qwen3_5RMSNorm\n'
+FUSION_HOOK = FUSION_ANCHOR + 'import sm120_attn.vllm_fusions  # noqa: F401  (KAI H200: fused GemmaRMSNorm, SM120_FUSED_NORM)\n'
 MLP_OLD = 'from .qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP\n'
 MLP_NEW = 'from .kai_persistent_mlp import QwenPersistentMLP as Qwen3NextMLP\n'
 MLP_CLASS = 'class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid):\n'
@@ -61,12 +64,16 @@ def main():
     ap.add_argument('--target', type=Path, required=True, help='directory of the vllm package (contains v1/, model_executor/)')
     ap.add_argument('--with-mlp-fusion', action='store_true', help='also install extras/bf16_mlp_fusion (BF16 weights only)')
     ap.add_argument('--check', action='store_true')
+    ap.add_argument('--no-fusions', action='store_true', help='do not install the H200 import-time fusions into qwen3_5.py')
     args = ap.parse_args()
     t = args.target.resolve()
     fa = t / 'v1/attention/backends/flash_attn.py'
     if not fa.exists():
         sys.exit(f'{fa} not found: --target must be the vllm package directory')
     print('flash_attn.py:', patch_file(fa, ANCHOR, HOOK, args.check))
+    if not args.no_fusions:
+        q35 = t / 'model_executor/models/qwen3_5.py'
+        print('qwen3_5.py fusions import:', patch_file(q35, FUSION_ANCHOR, FUSION_HOOK, args.check) if q35.exists() else 'qwen3_5.py not found')
     if args.with_mlp_fusion:
         models = t / 'model_executor/models'
         q = models / 'qwen3_5.py'

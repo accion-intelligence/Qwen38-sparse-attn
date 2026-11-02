@@ -15,6 +15,10 @@ At 256K input length, the optimized BF16 GEMM configuration reduces time to firs
 **81.66 s to 49.45 s (1.65×)**. Combining the attention kernels with vLLM's built-in FP8 GEMM brings
 that to **36.16 s**. The configurations and contributions behind these numbers are detailed below.
 
+**H200 (SM90) branch:** the same model on one NVIDIA H200 reaches 4657 / 10426 / 28789 ms TTFT at 64K / 128K /
+256K (-30% / -35% / -32% vs stock vLLM) with FlashAttention-4 block-sparse attention plus FP8 GEMM; see
+[docs/h200-summary.md](docs/h200-summary.md) (summary) and [docs/h200.md](docs/h200.md) (full log).
+
 [Deployment guide](docs/deployment.md) · [Full results](docs/results.md) ·
 [Kernel design](docs/kernels.md) · [Performance chart](docs/speedup.html) ·
 [About Accion Intelligence](#about-accion-intelligence)

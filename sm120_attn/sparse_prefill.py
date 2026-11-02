@@ -13,14 +13,39 @@ import os
 
 import torch
 
-BLOCK = 64
+BLOCK = 64          # key block (tokens) for selection and for every kernel
+FA4_QB = 128        # query rows per block for the FA4 / SM90 kernel (its tile_m)
+# query rows per *selection* block on the FA4 path (64 = the SM120 granularity, unioned in pairs into the
+# 128-row kernel blocks; 128 = one score per kernel tile, cheaper but coarser). Env SM120_SPARSE_SELECT_QB.
+SELECT_QB = int(os.environ.get('SM120_SPARSE_SELECT_QB', '64'))
+assert FA4_QB % SELECT_QB == 0
+# FA4 path reads the paged KV cache in place when vLLM's page size is a multiple of BLOCK (e.g. --block-size 1024)
+# and tools/patch_fa4.py is applied; SM120_SPARSE_PAGED=0 forces the gather path.
+PAGED_FA4 = os.environ.get('SM120_SPARSE_PAGED', '1') not in ('0', 'false', 'False')
+# FA4 tile schedule: 'sorted' = persistent CTAs over tiles sorted by list length (needs patch 4), 'static' = FA4's
+# own non-persistent LPT grid. Env SM120_SPARSE_SCHED.
+FA4_SCHED = os.environ.get('SM120_SPARSE_SCHED', 'sorted')   # 'sorted' = longest lists first (patch 4); 'static' = FA4's own grid
+
+
+def _pack_block_lists(sel: torch.Tensor):
+    """[H, MB, NB] bool -> FA4 lists: counts [1, H, MB] int32 and indices [1, H, MB, NB] int32 with the selected
+    key blocks packed first in ascending order (FA4 walks a list from its end, i.e. diagonal first)."""
+    cnt = sel.sum(-1, dtype=torch.int32)
+    idx = torch.argsort((~sel).to(torch.int8), dim=-1, stable=True).to(torch.int32)
+    return cnt[None], idx[None]
 
 
 class SparsePrefill:
     def __init__(self, num_heads: int, num_kv_heads: int, head_dim: int, device,
                  tau: float = 0.95, min_kv: int = 8192, min_q: int = 1024,
-                 workspace_bytes: int = 256 << 20, kernel: str = 'sm120fp8', fp8_pipeline: str = 'tma'):
+                 workspace_bytes: int = 256 << 20, kernel: str = 'sm120fp8', fp8_pipeline: str = 'tma',
+                 fi_backend: str | None = None, fused_select: bool | None = None):
         self.kernel = kernel
+        # FA4 path: one Triton kernel for selection + list packing (SM120_SPARSE_FUSED_SELECT=0 -> torch ops)
+        self.fused_select = (os.environ.get('SM120_SPARSE_FUSED_SELECT', '1') not in ('0', 'false', 'False')) \
+            if fused_select is None else fused_select
+        # FlashInfer BSR backend for kernel='flashinfer': 'fa2' (SM80+) or 'fa3' (SM90 wgmma); env override
+        self.fi_backend = fi_backend or os.environ.get('SM120_SPARSE_FI_BACKEND', 'fa2')
         self.fp8_pipeline = fp8_pipeline     # 'tma' (warp-specialised TMA/mbarrier fp8 kernel) | 'cpasync'
         self.H, self.Hk, self.D = num_heads, num_kv_heads, head_dim
         self.g = num_heads // num_kv_heads
@@ -30,8 +55,13 @@ class SparsePrefill:
         if kernel == 'flashinfer':      # retired reference path; needs flashinfer-python
             import flashinfer
             self.workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=device)
-            self.wrapper = flashinfer.BlockSparseAttentionWrapper(self.workspace, backend='fa2')
+            self.wrapper = flashinfer.BlockSparseAttentionWrapper(self.workspace, backend=self.fi_backend)
         self.stats = {'calls': 0, 'blocks_total': 0, 'blocks_kept': 0, 'plan_ms': 0.0, 'run_ms': 0.0, 'select_ms': 0.0}
+        # FA4 path: list-length skew statistics (SM120_SPARSE_LIST_STATS=1), see list_stats_summary()
+        self.list_stats = None
+        if os.environ.get('SM120_SPARSE_LIST_STATS', '0') in ('1', 'true', 'True'):
+            z = lambda: torch.zeros((), dtype=torch.float32, device=device)
+            self.list_stats = {'sum_max': z(), 'sum_mean': z(), 'sum_head_cv': z(), 'calls': 0}
         self._kept_acc = None
         self.timing = False
 
@@ -39,10 +69,13 @@ class SparsePrefill:
         return q_len >= self.min_q and kv_len >= self.min_kv
 
     @torch.no_grad()
-    def block_masks(self, q: torch.Tensor, k, q_start: int, valid=None, union: bool = True, km=None):
+    def block_masks(self, q: torch.Tensor, k, q_start: int, valid=None, union: bool = True, km=None,
+                    qb: int = BLOCK):
         """q [n, H, D]; k [Hk, N, D] (head-major) or [N, Hk, D] (NHD) with N a multiple of BLOCK;
         q_start = absolute position of q[0]. Returns bool masks [Hk, MB, NB] (union over the query
         heads of each KV head) or [H, MB, NB] per query head when union=False.
+        qb = query rows per block (64 for the SM120 kernels, 128 for the FA4/SM90 kernel); key blocks
+        are always BLOCK (64) tokens. Every q block keeps the key blocks it overlaps (diagonal) and block 0.
         """
         n = q.shape[0]
         if km is not None:                                   # cached block means [Hk, NB, D] (fp32)
@@ -52,22 +85,25 @@ class SparsePrefill:
             head_major = k.shape[0] == self.Hk and k.shape[1] != self.Hk
             N = k.shape[1] if head_major else k.shape[0]
             NB = N // BLOCK
-        MB = -(-n // BLOCK)
+        MB = -(-n // qb)
         dev = q.device
-        assert n % BLOCK == 0 and q_start % BLOCK == 0, 'callers pad q to whole blocks'
+        assert n % qb == 0, 'callers pad q to whole blocks'
+        assert qb == BLOCK or qb % BLOCK == 0, 'query block must be a multiple of the key block'
         if valid is None:
             valid = (0, n)
         rows = torch.arange(n, device=dev)
         real = ((rows >= valid[0]) & (rows < valid[0] + valid[1])).float()
-        counts = real.view(MB, BLOCK).sum(1).clamp_min(1.0)
-        qm = (q.float() * real[:, None, None]).view(MB, BLOCK, self.H, self.D).sum(1) / counts[:, None, None]
+        counts = real.view(MB, qb).sum(1).clamp_min(1.0)
+        qm = (q.float() * real[:, None, None]).view(MB, qb, self.H, self.D).sum(1) / counts[:, None, None]
         if km is None and head_major:
             km = k.view(self.Hk, NB, BLOCK, self.D).float().mean(2)                  # [Hk, NB, D]
         elif km is None:
             km = k.view(NB, BLOCK, self.Hk, self.D).float().mean(1).transpose(0, 1)  # [Hk, NB, D]
-        gi = (q_start // BLOCK) + torch.arange(MB, device=dev)                       # diagonal block per q block
+        first_pos = q_start + qb * torch.arange(MB, device=dev)                      # absolute first row per q block
+        gi_first = first_pos // BLOCK                                                # key blocks overlapping the q block
+        gi_last = (first_pos + qb - 1) // BLOCK
         j = torch.arange(NB, device=dev)
-        future = j[None, :] > gi[:, None]                                            # [MB, NB]
+        future = j[None, :] > gi_last[:, None]                                       # [MB, NB]
         qg = qm.view(MB, self.Hk, self.g, self.D)
         logits = torch.einsum('mhgd,hnd->hmgn', qg, km) * self.scale                 # [Hk, MB, g, NB]
         logits.masked_fill_(future[None, :, None, :], float('-inf'))
@@ -79,7 +115,7 @@ class SparsePrefill:
             masks = sel.any(2)                                                       # [Hk, MB, NB]
         else:
             masks = sel.permute(0, 2, 1, 3).reshape(self.H, MB, NB)                  # [H, MB, NB], head = kvh * g + i
-        masks[:, torch.arange(MB, device=dev), gi] = True                            # diagonal
+        masks |= ((j[None, :] >= gi_first[:, None]) & (j[None, :] <= gi_last[:, None]))[None]   # diagonal
         masks[:, :, 0] = True                                                        # sink
         masks &= ~future[None]
         return masks
@@ -93,6 +129,8 @@ class SparsePrefill:
             return self.forward_sm120(q, k, v, q_start, out)
         if self.kernel == 'sm120fp8':
             return self.forward_sm120fp8(q, k, v, q_start, out)
+        if self.kernel == 'fa4':
+            return self.forward_fa4(q, k, v, q_start, out)
         n = q.shape[0]
         kv_len = q_start + n
         assert k.shape[1] >= kv_len, (q_start, n, k.shape)
@@ -246,6 +284,107 @@ class SparsePrefill:
         out.copy_(o)
         return out
 
+    @torch.no_grad()
+    def forward_fa4(self, q, k, v, q_start, out=None, km=None, page_table=None):
+        """SM90 (H100/H200): FlashAttention-4 CuTe DSL forward (wgmma, TMA, warp-specialised) with per-query-head
+        block lists over FA4_QB-row query blocks x BLOCK-token key blocks. Blocks that cross the causal boundary
+        go to the 'mask' list (kernel applies the causal mask), fully visible blocks to the 'full' list.
+
+        q [n, H, D] bf16 at absolute positions q_start..; k, v NHD [T, Hk, D] with T >= q_start + n (rows beyond
+        the sequence are ignored); km: optional cached key block means [Hk, >= ceil(kv_len/BLOCK), D] fp32.
+        No host syncs. The last call's masks are kept in self.last_masks for tests.
+        """
+        from flash_attn.cute import flash_attn_func
+        from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
+        QB = FA4_QB
+        n = q.shape[0]
+        kv_len = q_start + n
+        NB = -(-kv_len // BLOCK)
+        if page_table is None:
+            assert k.shape[0] >= kv_len and v.shape[0] >= kv_len
+            k, v = k[:kv_len], v[:kv_len]              # exact length: FA4 aligns causal bottom-right, i.e. offset q_start
+        else:
+            # paged: k, v are the caches viewed as [num_pages, BLOCK, Hk, D]; page_table [1, >= NB] int32 maps the
+            # request's key blocks to pages (needs tools/patch_fa4.py); km must be supplied by the caller.
+            assert km is not None and page_table.shape[1] >= NB and k.shape[1] == BLOCK
+        pad = (-n) % QB
+        qp = q if pad == 0 else torch.cat([q, q.new_zeros(pad, self.H, self.D)])
+        MB = qp.shape[0] // QB
+        dev = q.device
+        t0 = self._tick()
+        if km is None:
+            kpad = torch.nn.functional.pad(k, (0, 0, 0, 0, 0, NB * BLOCK - kv_len)) if NB * BLOCK != kv_len else k
+            cnt = torch.full((NB,), float(BLOCK), device=dev)
+            cnt[-1] = kv_len - (NB - 1) * BLOCK
+            km = (kpad.view(NB, BLOCK, self.Hk, self.D).float().sum(1) / cnt[:, None, None]).transpose(0, 1)
+        elif km.shape[1] < NB:
+            km = torch.nn.functional.pad(km, (0, 0, 0, NB - km.shape[1]))
+        else:
+            km = km[:, :NB]
+        SUB = QB // SELECT_QB
+        if self.fused_select:
+            from .select_fused import block_scores, fused_select
+            logits = block_scores(qp, km, self.Hk, self.scale, qb=SELECT_QB, valid_rows=n)         # [H, MB*SUB, NB]
+            mc, mi, fc, fi = fused_select(logits, q_start, self.tau, qb=QB, kb=BLOCK, sub=SUB)
+            kept_now = (mc + fc).sum()
+            masks = None
+        else:
+            masks = self.block_masks(qp, None, q_start, valid=(0, n), union=False, km=km, qb=SELECT_QB)   # [H, MB*SUB, NB]
+            if SUB > 1:
+                masks = masks.view(self.H, MB, SUB, NB).any(2)                                         # [H, MB, NB]
+            j = torch.arange(NB, device=dev)
+            first_pos = q_start + QB * torch.arange(MB, device=dev)
+            full = masks & ((BLOCK * j + BLOCK - 1)[None, None, :] <= first_pos[None, :, None])
+            part = masks & ~full
+            mc, mi = _pack_block_lists(part)
+            fc, fi = _pack_block_lists(full)
+            kept_now = masks.sum()
+        order = None
+        if FA4_SCHED == 'sorted':
+            # persistent sorted scheduler (tools/patch_fa4.py patch 4): tile (h, m) -> h * MB + m, longest lists first
+            order = torch.argsort((mc + fc)[0].reshape(-1), descending=True).to(torch.int32)
+        bst = BlockSparseTensorsTorch(mc, mi, fc, fi, block_size=(QB, BLOCK), cu_block_idx_offsets=order)
+        self.last_lists = (mc, mi, fc, fi)
+        if self.list_stats is not None:                 # per-CTA work skew (device tensors, no host sync)
+            tot = (mc + fc)[0].float()                    # [H, MB] blocks per (head, q block)
+            self.list_stats['sum_max'] += tot.max()
+            self.list_stats['sum_mean'] += tot.mean()
+            self.list_stats['sum_head_cv'] += (tot.mean(1).std() / tot.mean().clamp_min(1.0))
+            self.list_stats['calls'] += 1
+        t1 = self._tick()
+        if page_table is None:
+            res = flash_attn_func(q[None], k[None], v[None], softmax_scale=self.scale, causal=True, pack_gqa=False,
+                                  block_sparse_tensors=bst)
+        else:
+            from flash_attn.cute.interface import _flash_attn_fwd
+            seqused_k = torch.tensor([kv_len], dtype=torch.int32, device=dev)
+            res = _flash_attn_fwd(q[None], k, v, page_table=page_table, seqused_k=seqused_k, softmax_scale=self.scale,
+                                  causal=True, pack_gqa=False, block_sparse_tensors=bst)
+        o = (res[0] if isinstance(res, (tuple, list)) else res)[0]          # (out, lse) or out; drop the batch dim
+        t2 = self._tick()
+        if self.timing:
+            self.stats['select_ms'] += t1 - t0
+            self.stats['run_ms'] += t2 - t1
+        self.stats['calls'] += 1
+        # causal key blocks per q block b: floor((q_start + QB(b+1) - 1)/BLOCK) + 1  (exact for q_start % BLOCK == 0)
+        r = QB // BLOCK
+        self.stats['blocks_total'] += int(self.H * (MB * (q_start // BLOCK) + r * MB * (MB + 1) // 2))
+        self._kept_acc = kept_now if self._kept_acc is None else self._kept_acc + kept_now
+        self.last_masks = masks
+        if out is None:
+            return o
+        out.copy_(o)
+        return out
+
+    def list_stats_summary(self):
+        """Mean over calls of (max / mean list length over the (head, q block) CTAs) and of the coefficient of
+        variation of the per-head mean list length: how skewed the sparse kernel's CTA work is."""
+        if self.list_stats is None or self.list_stats['calls'] == 0:
+            return None
+        c = self.list_stats['calls']
+        return {'max_over_mean': float(self.list_stats['sum_max'].item() / max(1e-6, self.list_stats['sum_mean'].item())),
+                'head_cv': float(self.list_stats['sum_head_cv'].item() / c), 'calls': c}
+
     def kept_fraction(self):
         """Blocks kept / causal blocks over all SM120 calls so far (one device sync)."""
         if self._kept_acc is None or not self.stats['blocks_total']:
@@ -355,6 +494,15 @@ def _debug(msg):
         print('[sm120-sparse] ' + msg, flush=True)
 
 
+def _default_kernel():
+    """'fa4' (FlashAttention-4 CuTe, block-sparse) on SM90, the SM120 FP8 kernel elsewhere."""
+    try:
+        major = torch.cuda.get_device_capability()[0]
+    except Exception:
+        return 'sm120fp8'
+    return 'fa4' if major == 9 else 'sm120fp8'
+
+
 def config():
     """SM120_SPARSE_* environment variables, with optional defaults from the JSON file named by
     SM120_SPARSE_CONFIG (useful when a launcher does not forward environment variables)."""
@@ -374,7 +522,7 @@ def config():
             'tau': pick('SM120_SPARSE_TAU', 'tau', 0.95, float),
             'min_kv': pick('SM120_SPARSE_MIN_KV', 'min_kv', 8192, int),
             'min_q': pick('SM120_SPARSE_MIN_Q', 'min_q', 1024, int),
-            'kernel': pick('SM120_SPARSE_KERNEL', 'kernel', 'sm120fp8', str),
+            'kernel': pick('SM120_SPARSE_KERNEL', 'kernel', _default_kernel(), str),
             'fp8_pipeline': pick('SM120_SPARSE_FP8_PIPELINE', 'fp8_pipeline', 'tma', str),
         }
         print('[sm120-sparse] config %r' % (_CONFIG,), flush=True)
@@ -395,7 +543,7 @@ _KMEAN_CACHE: dict = {}
 _KMEAN_MAX_ENTRIES = 128
 
 
-def _cached_block_means(layer_key, first_page, key_chunk, q_start, kv_len, key_all=None):
+def _cached_block_means(layer_key, first_page, key_chunk, q_start, kv_len, key_all=None, key_all_fn=None):
     """Maintain per-(layer, request) K block means [Hk, NB, D] (fp32), updated from the chunk's keys.
 
     A request is identified by its first physical page. An entry is only trusted when it was built
@@ -416,6 +564,8 @@ def _cached_block_means(layer_key, first_page, key_chunk, q_start, kv_len, key_a
         entry = {'km': torch.zeros(Hk, cap, D, dtype=torch.float32, device=key_chunk.device), 'nb': 0, 'last_kv': 0}
         _KMEAN_CACHE[cache_key] = entry
         if q_start > 0:
+            if key_all is None and key_all_fn is not None:
+                key_all = key_all_fn()                 # paged path: gather the history only for a rebuild
             if key_all is None:
                 raise RuntimeError('stale block-mean cache entry and no key history to rebuild it')
             # rebuild the means of the blocks before this chunk from the request's own history
@@ -505,7 +655,7 @@ def try_sparse_forward(impl, query, key, key_cache, value_cache, output, attn_me
     kc = key_cache.permute(2, 0, 1, 3)       # [Hk, num_blocks, page, D] view
     vc = value_cache.permute(2, 0, 1, 3)
     bt = attn_metadata.block_table
-    first_pages = bt[:nreq, 0].tolist() if sp.kernel in ('sm120', 'sm120fp8') else None
+    first_pages = bt[:nreq, 0].tolist() if sp.kernel in ('sm120', 'sm120fp8', 'fa4') else None
     for r in range(nreq):
         kv_len = seq_lens[r]
         n = qsl[r + 1] - qsl[r]
@@ -517,11 +667,24 @@ def try_sparse_forward(impl, query, key, key_cache, value_cache, output, attn_me
             continue
         npages = -(-kv_len // page)
         pages = bt[r, :npages].long()
-        if sp.kernel in ('sm120', 'sm120fp8'):
+        if sp.kernel == 'fa4' and PAGED_FA4 and page % BLOCK == 0 and key_cache.is_contiguous() and value_cache.is_contiguous():
+            # (KV connectors / cross-layer cache layouts give strided caches: those take the gather path below)
+            # read vLLM's paged cache in place: view pages as BLOCK-token sub-pages, expand the block table
+            P = page // BLOCK
+            kc = key_cache.view(-1, BLOCK, Hk, D)
+            vc = value_cache.view(-1, BLOCK, Hk, D)
+            pt = (pages[:, None] * P + torch.arange(P, device=pages.device)[None, :]).reshape(1, -1).to(torch.int32)
+            gather = lambda: key_cache[pages].reshape(npages * page, Hk, D)
+            km = _cached_block_means(id(impl), first_pages[r], key[qsl[r]:qsl[r + 1]], kv_len - n, kv_len, key_all_fn=gather)
+            sp.forward_fa4(q_r, kc, vc, kv_len - n, out=o_r, km=km, page_table=pt)
+            continue
+        if sp.kernel in ('sm120', 'sm120fp8', 'fa4'):
             k = key_cache[pages].reshape(npages * page, Hk, D)    # one gather copy, NHD
             v = value_cache[pages].reshape(npages * page, Hk, D)
             km = _cached_block_means(id(impl), first_pages[r], key[qsl[r]:qsl[r + 1]], kv_len - n, kv_len, key_all=k)
-            if sp.kernel == 'sm120fp8':
+            if sp.kernel == 'fa4':
+                sp.forward_fa4(q_r, k, v, kv_len - n, out=o_r, km=km)
+            elif sp.kernel == 'sm120fp8':
                 scales = _cached_scales(id(impl), first_pages[r], q_r, k[:kv_len], v[:kv_len], kv_len - n)
                 sp.forward_sm120fp8(q_r, k, v, kv_len - n, out=o_r, km=km, scales=scales)
             else:

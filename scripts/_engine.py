@@ -16,6 +16,7 @@ def add_engine_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument('--gpu-memory-utilization', type=float, default=0.9)
     ap.add_argument('--quantization', default=None, help="e.g. fp8 (W8A8 dynamic FP8 GEMM)")
     ap.add_argument('--kv-cache-dtype', default=None)
+    ap.add_argument('--block-size', type=int, default=None, help='KV page size in tokens (1024 = multiple of the 64-token sparse block: paged FA4 path)')
     ap.add_argument('--no-enforce-eager', action='store_true', help='allow CUDA graphs (the scripts default to eager)')
 
 
@@ -27,6 +28,8 @@ def make_llm(args):
         extra['quantization'] = args.quantization
     if args.kv_cache_dtype:
         extra['kv_cache_dtype'] = args.kv_cache_dtype
+    if getattr(args, 'block_size', None):
+        extra['block_size'] = args.block_size
     return LLM(model=args.model, dtype=args.dtype, max_model_len=args.max_model_len, enforce_eager=not args.no_enforce_eager,
                gpu_memory_utilization=args.gpu_memory_utilization, max_num_batched_tokens=args.max_num_batched_tokens,
                max_num_seqs=args.max_num_seqs, enable_chunked_prefill=True, enable_prefix_caching=False, seed=20261015, **extra)

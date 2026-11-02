@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.egg-info/
+/build/
+/dist/
+# local experiment outputs (prompts, benchmark and validation runs live under $H200_WORK)
+/prompts*.json
+/ttft-*/
+/gen-*.json
+/tfe-*.json

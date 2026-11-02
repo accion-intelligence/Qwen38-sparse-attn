@@ -12,7 +12,8 @@ license = {text = "Apache-2.0"}
 dependencies = [
   "torch>=2.8",
   "nvidia-cutlass-dsl>=4.7.1",
-  "cuda-python>=13.0",
+  # CUDA 13 on SM120 (README); CUDA 12.9 on the H200 node (driver 575 caps at 12.9), see docs/h200.md
+  "cuda-python>=12.9",
 ]
 
 [project.optional-dependencies]

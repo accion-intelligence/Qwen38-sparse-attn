@@ -1,0 +1,10 @@
+== 8192 x 65536 (key block 64): dense FA3   16.61 ms ( 744 TFLOPS) | dense FA4     nan ms ( nan TFLOPS)
+   FA4 sparse [static] kept=0.523 (list max/mean 1.60):    8.85 ms  ( 731 TFLOPS on kept)  = 1.88x dense FA3; time ratio 0.532
+   FA4 sparse [sorted] kept=0.523 (list max/mean 1.60):    8.79 ms  ( 735 TFLOPS on kept)  = 1.89x dense FA3; time ratio 0.529
+   FA4 sparse [static] kept=0.393 (list max/mean 1.68):    7.43 ms  ( 654 TFLOPS on kept)  = 2.24x dense FA3; time ratio 0.447
+   FA4 sparse [sorted] kept=0.393 (list max/mean 1.68):    7.40 ms  ( 656 TFLOPS on kept)  = 2.24x dense FA3; time ratio 0.446
+== 8192 x 262144 (key block 64): dense FA3   71.96 ms ( 722 TFLOPS) | dense FA4     nan ms ( nan TFLOPS)
+   FA4 sparse [static] kept=0.537 (list max/mean 1.58):   50.92 ms  ( 548 TFLOPS on kept)  = 1.41x dense FA3; time ratio 0.708
+   FA4 sparse [sorted] kept=0.537 (list max/mean 1.58):   43.36 ms  ( 644 TFLOPS on kept)  = 1.66x dense FA3; time ratio 0.603
+   FA4 sparse [static] kept=0.372 (list max/mean 1.68):   32.14 ms  ( 601 TFLOPS on kept)  = 2.24x dense FA3; time ratio 0.447
+   FA4 sparse [sorted] kept=0.372 (list max/mean 1.68):   29.83 ms  ( 647 TFLOPS on kept)  = 2.41x dense FA3; time ratio 0.415
